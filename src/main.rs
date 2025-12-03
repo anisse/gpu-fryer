@@ -66,6 +66,10 @@ struct Args {
     /// Use FP8 precision. GPU must support FP8 type.
     #[clap(long)]
     use_fp8: bool,
+    /// GPU list, comma-separated. Starts with 0 and follows current CUDA numbering. All GPUs are
+    /// used if not passed
+    #[clap(long, value_delimiter = ',')]
+    gpus: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +145,7 @@ struct Config {
     use_bf16: bool,
     use_fp8: bool,
     use_fp32: bool,
+    gpus: Option<Vec<usize>>,
 }
 
 trait VariablePrecisionFloat:
@@ -187,6 +192,7 @@ async fn main() {
         use_fp32: args.use_fp32,
         use_bf16: args.use_bf16,
         use_fp8: args.use_fp8,
+        gpus: args.gpus,
     };
 
     match run(config).await {
@@ -211,7 +217,7 @@ fn uuid_to_string(uuid: sys::CUuuid) -> String {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    let mut gpus = detect_gpus()?;
+    let mut gpus = detect_gpus(&config.gpus)?;
     if gpus.is_empty() {
         return Err(anyhow::anyhow!("No GPUs detected"));
     }
@@ -276,11 +282,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let nvml = nvml_builder.init().expect("Unable to initialize NVML. Check if the NVIDIA driver is installed and the NVIDIA Management Library is available (libnvidia-ml.so).");
     let config_clone = config.clone();
     let mut handles = Vec::new();
-    let gpu_len = gpus.len();
+    let gpu_ord2n = gpus
+        .iter()
+        .enumerate()
+        .map(|(i, gpu)| (gpu.ordinal(), i))
+        .collect::<HashMap<_, _>>();
     let t = tokio::spawn(async move {
         report_progress(
             config_clone,
-            gpu_len,
+            gpu_ord2n,
             nvml,
             rx,
             stop_clone,
@@ -438,7 +448,7 @@ fn supports_fp8(gpu: &Arc<CudaContext>) -> anyhow::Result<bool> {
 
 async fn report_progress(
     config: Config,
-    gpu_count: usize,
+    gpu_ordinal_to_n: HashMap<usize, usize>,
     nvml: Nvml,
     mut rx: Receiver<(usize, usize)>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -447,15 +457,24 @@ async fn report_progress(
     // Use a fixed interval for reporting
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
-    let mut burn_results = (0..gpu_count).map(BurnResult::new).collect::<Vec<_>>();
+    let gpu_count = gpu_ordinal_to_n.len();
+    let mut burn_results = (0..gpu_count)
+        .map(|i| {
+            let gpu_idx = gpu_ordinal_to_n
+                .iter()
+                .find_map(|(gpu_idx, num)| (i == *num).then_some(gpu_idx))
+                .expect("No {i}th gpu");
+            BurnResult::new(*gpu_idx)
+        })
+        .collect::<Vec<_>>();
 
     let mut tick = 0;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         interval.tick().await;
         let mut nops = vec![0usize; gpu_count];
         // Drain the channel to get the latest updates
-        while let Ok(ops) = rx.try_recv() {
-            nops[ops.0] += ops.1; // Accumulate operations
+        while let Ok((gpu_idx, val)) = rx.try_recv() {
+            nops[gpu_ordinal_to_n[&gpu_idx]] += val; // Accumulate operations
         }
         // If no operations were received, continue to the next tick (means no work done yet, still loading data)
         if nops.iter().all(|&x| x == 0) {
@@ -834,10 +853,17 @@ where
     Ok(())
 }
 
-fn detect_gpus() -> anyhow::Result<Vec<Arc<CudaContext>>> {
+fn detect_gpus(filter: &Option<Vec<usize>>) -> anyhow::Result<Vec<Arc<CudaContext>>> {
     let num_gpus = CudaContext::device_count()? as usize;
     let mut devices = Vec::new();
     for i in 0..num_gpus {
+        if let Some(ref keep_gpus) = filter {
+            // Naive way of filtering a small number (< 10) of GPUs
+            // If perf is ever needed, use a HashSet
+            if !keep_gpus.contains(&i) {
+                continue;
+            }
+        }
         let dev = CudaContext::new(i)?;
         devices.push(dev);
     }
